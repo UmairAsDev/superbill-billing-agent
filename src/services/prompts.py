@@ -39,7 +39,7 @@ if modifiers are needed, include them in the output.
 
 Return JSON with:
 - CPT codes
-- E/M codes (if applicable)
+- E/M codes
 - ICD-10 codes
 - Modifiers
 - Reasoning
