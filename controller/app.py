@@ -7,6 +7,10 @@ router = APIRouter()
 
 
 
+@router.get("/health")
+async def health_check():
+    return {"status": "ok"}
+
 @router.post("/process_note/{note_id}")
 async def process_note(note_id: int):
     graph = build_billing_graph()
