@@ -144,6 +144,19 @@ def _top_candidate_summary(items: Any, limit: int) -> List[Dict[str, Any]]:
     return out
 
 
+def _normalize_charge_per_unit(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return int(value) == 1
+    text = str(value or "").strip().lower()
+    if text in {"1", "true", "yes", "y"}:
+        return True
+    if text in {"0", "false", "no", "n", ""}:
+        return False
+    return False
+
+
 def _partition_service_items(
     service_items: List[Dict[str, Any]],
     enm_index: Dict[str, Dict[str, Any]],
@@ -356,8 +369,8 @@ async def postprocess_billing_node(state: BillingState) -> BillingState:
     def build_row(item: Dict[str, Any]) -> None:
         code = str(item.get("code"))
         meta = index["procedures"].get(code) or index["enm"].get(code) or {}
-        charge_per_unit = meta.get("ChargePerUnit")
-        charge_flag = "Yes" if charge_per_unit else "No"
+        charge_per_unit_flag = _normalize_charge_per_unit(meta.get("ChargePerUnit"))
+        charge_flag = "YES" if charge_per_unit_flag else "NO"
 
         qty_value = item.get("units", None)
         if qty_value is None:
