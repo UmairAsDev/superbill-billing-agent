@@ -17,6 +17,7 @@ class BillingState(TypedDict, total=False):
     needs_review: bool
     review_reasons: List[str]
     manual_review: Dict[str, Any]
+    html_table: str
 
     billing_result: Dict[str, Any]
     parsed_procedure: Dict[str, Any]

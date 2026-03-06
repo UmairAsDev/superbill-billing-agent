@@ -1,6 +1,7 @@
 import json
 import re
 import sys
+from html import escape
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -157,6 +158,104 @@ def _normalize_charge_per_unit(value: Any) -> bool:
     return False
 
 
+def _extract_item_modifiers(item: Dict[str, Any]) -> List[str]:
+    return (
+        _normalize_list(item.get("modifiers"))
+        or _normalize_list(item.get("modifier"))
+        or _normalize_list(item.get("modifierId"))
+        or _normalize_list(item.get("modifier_id"))
+    )
+
+
+def _candidate_metadata_index(items: Any) -> Dict[str, Dict[str, Any]]:
+    out: Dict[str, Dict[str, Any]] = {}
+    if not isinstance(items, list):
+        return out
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        code = str(item.get("code") or "").strip()
+        metadata = item.get("metadata")
+        if code and isinstance(metadata, dict):
+            out[code] = metadata
+    return out
+
+
+def _normalize_date_of_service(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    if "T" in text:
+        return text.split("T", 1)[0]
+    if " " in text:
+        return text.split(" ", 1)[0]
+    return text
+
+
+def _build_billing_html_table(note_id: Any, date_of_service: Any, billing_result: Dict[str, Any]) -> str:
+    note_id_text = escape(str(note_id or ""))
+    dos_text = escape(_normalize_date_of_service(date_of_service))
+    rows = billing_result.get("rows", []) if isinstance(billing_result, dict) else []
+    if not isinstance(rows, list):
+        rows = []
+
+    row_html: List[str] = []
+    for row in rows:
+        procedure = escape(str(row.get("procedure") or ""))
+        code = escape(str(row.get("code") or ""))
+        modifiers = row.get("modifiers")
+        modifier_text = ""
+        if isinstance(modifiers, list):
+            modifier_text = ", ".join(str(mod).strip() for mod in modifiers if str(mod).strip())
+        else:
+            modifier_text = str(modifiers or "").strip()
+
+        qty = escape(str(row.get("qty") if row.get("qty") is not None else ""))
+        charge_per_unit_raw = str(row.get("charge_per_unit") or "").strip().upper()
+        charge_per_unit = "Yes" if charge_per_unit_raw == "YES" else "No"
+
+        dx_codes = row.get("dx_codes")
+        if isinstance(dx_codes, list):
+            dx_text = ", ".join(str(code).strip() for code in dx_codes if str(code).strip())
+        else:
+            dx_text = str(dx_codes or "").strip()
+
+        row_html.append(
+            "    <tr>"
+            f"<td>{dos_text}</td>"
+            f"<td>{procedure}</td>"
+            f"<td>{code}</td>"
+            f"<td>{escape(modifier_text)}</td>"
+            f"<td>{qty}</td>"
+            f"<td>{charge_per_unit}</td>"
+            f"<td>{escape(dx_text)}</td>"
+            "</tr>"
+        )
+
+    body = "\n".join(row_html)
+    return (
+        '<table border="1" cellpadding="6" cellspacing="0" style="border-collapse:collapse; width:100%;">\n'
+        "  <thead>\n"
+        "    <tr>\n"
+        f"      <th colspan=\"7\" style=\"text-align:left;\">Note ID: {note_id_text}</th>\n"
+        "    </tr>\n"
+        "    <tr>\n"
+        "      <th>Date of Service</th>\n"
+        "      <th>Procedure Description</th>\n"
+        "      <th>CPT/HCPCS Code</th>\n"
+        "      <th>Modifiers (if any)</th>\n"
+        "      <th>Quantity</th>\n"
+        "      <th>Charge per Unit</th>\n"
+        "      <th>ICD-10 Codes</th>\n"
+        "    </tr>\n"
+        "  </thead>\n"
+        "  <tbody>\n"
+        f"{body}\n"
+        "  </tbody>\n"
+        "</table>"
+    )
+
+
 def _partition_service_items(
     service_items: List[Dict[str, Any]],
     enm_index: Dict[str, Dict[str, Any]],
@@ -246,6 +345,8 @@ async def postprocess_billing_node(state: BillingState) -> BillingState:
 
     retrieval = state.get("retrieval", [])
     index = _index_retrieval(retrieval)
+    procedure_candidate_meta = _candidate_metadata_index(state.get("procedure_candidates"))
+    enm_candidate_meta = _candidate_metadata_index(state.get("enm_candidates"))
     procedure_candidate_codes = _candidate_code_set(state.get("procedure_candidates"))
     enm_candidate_codes = _candidate_code_set(state.get("enm_candidates"))
     modifier_candidate_codes = _candidate_code_set(state.get("modifier_candidates"))
@@ -367,9 +468,20 @@ async def postprocess_billing_node(state: BillingState) -> BillingState:
                 )
 
     def build_row(item: Dict[str, Any]) -> None:
+        nonlocal needs_review
         code = str(item.get("code"))
-        meta = index["procedures"].get(code) or index["enm"].get(code) or {}
-        charge_per_unit_flag = _normalize_charge_per_unit(meta.get("ChargePerUnit"))
+        meta = (
+            index["procedures"].get(code)
+            or index["enm"].get(code)
+            or procedure_candidate_meta.get(code)
+            or enm_candidate_meta.get(code)
+            or {}
+        )
+        if not meta:
+            needs_review = True
+            review_reasons.append(f"Missing retrieval rule metadata for code {code}; charge per unit could not be sourced.")
+
+        charge_per_unit_flag = _normalize_charge_per_unit(meta.get("ChargePerUnit")) if meta else False
         charge_flag = "YES" if charge_per_unit_flag else "NO"
 
         qty_value = item.get("units", None)
@@ -387,7 +499,7 @@ async def postprocess_billing_node(state: BillingState) -> BillingState:
         row_modifiers: List[str] = []
         row_modifiers.extend(global_modifiers)
         row_modifiers.extend(modifier_map.get(code, []))
-        llm_item_modifiers = _normalize_list(item.get("modifiers"))
+        llm_item_modifiers = _extract_item_modifiers(item)
         accepted_llm_modifiers: List[str] = []
         for mod in llm_item_modifiers:
             if modifier_candidate_codes and str(mod).strip() not in modifier_candidate_codes:
@@ -526,5 +638,12 @@ async def postprocess_billing_node(state: BillingState) -> BillingState:
         "manual_review": manual_review,
         "raw_llm_output": llm_output,
     }
+
+    notes = state.get("notes", {}) if isinstance(state.get("notes"), dict) else {}
+    visit = notes.get("visit", {}) if isinstance(notes.get("visit"), dict) else {}
+    date_of_service = visit.get("date")
+    billing_html_table = _build_billing_html_table(state.get("note_id"), date_of_service, state["billing_result"])
+    state["billing_result"]["html_table"] = billing_html_table
+    state["html_table"] = billing_html_table
 
     return state
