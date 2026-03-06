@@ -9,6 +9,14 @@ class BillingState(TypedDict, total=False):
     billing_context: Dict[str, Any]
     retrieved_data: Dict[str, Any]
     retrieval: List[Dict[str, Any]]
+    encounter_facts: Dict[str, Any]
+    procedure_candidates: List[Dict[str, Any]]
+    enm_candidates: List[Dict[str, Any]]
+    modifier_candidates: List[Dict[str, Any]]
+    candidate_reasoning: List[Dict[str, Any]]
+    needs_review: bool
+    review_reasons: List[str]
+    manual_review: Dict[str, Any]
 
     billing_result: Dict[str, Any]
     parsed_procedure: Dict[str, Any]

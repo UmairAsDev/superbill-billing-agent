@@ -27,6 +27,12 @@ class Config(BaseSettings):
     PRO_CODE_FILE: str = "proCodeList.csv"
     MODIFIER_FILE: str = "modifierList.csv"
     ENM_FILE: str = "enmCodeList.csv"
+
+    # Billing policy settings
+    EM_POLICY_TEXT: str = (
+        "For signed office notes, include one appropriate office E/M code when "
+        "documentation supports evaluation and management services."
+    )
     
 
 

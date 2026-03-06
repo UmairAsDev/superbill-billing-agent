@@ -11,6 +11,8 @@ from src.agent.nodes import (
 	billing_reasoning_node,
 )
 from src.agent.retrieval_node import retrieval_node
+from src.agent.fact_extractor_node import note_fact_extractor_node
+from src.agent.candidate_selection_node import candidate_selection_node
 from src.agent.llm_node import billing_llm_node
 from src.agent.postprocess_node import postprocess_billing_node
 
@@ -24,6 +26,8 @@ def build_billing_graph():
 	graph.add_node("prescriptions", prescriptions_node)
 	graph.add_node("retrieval", retrieval_node)
 	graph.add_node("billing_reasoning", billing_reasoning_node)
+	graph.add_node("fact_extractor", note_fact_extractor_node)
+	graph.add_node("candidate_selection", candidate_selection_node)
 	graph.add_node("billing_llm", billing_llm_node)
 	graph.add_node("postprocess", postprocess_billing_node)
 
@@ -33,7 +37,9 @@ def build_billing_graph():
 	graph.add_edge("mohs", "prescriptions")
 	graph.add_edge("prescriptions", "retrieval")
 	graph.add_edge("retrieval", "billing_reasoning")
-	graph.add_edge("billing_reasoning", "billing_llm")
+	graph.add_edge("billing_reasoning", "fact_extractor")
+	graph.add_edge("fact_extractor", "candidate_selection")
+	graph.add_edge("candidate_selection", "billing_llm")
 	graph.add_edge("billing_llm", "postprocess")
 	graph.add_edge("postprocess", END)
 
