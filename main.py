@@ -1,6 +1,7 @@
 import sys
 import uvicorn
 from pathlib import Path
+
 sys.path.append(str(Path(__file__).parent.parent))
 from controller.app import router
 from fastapi.middleware.cors import CORSMiddleware
@@ -18,10 +19,8 @@ app.add_middleware(
 app.include_router(router)
 
 
-
-
 def main():
-    uvicorn.run("main:app", host="0.0.0.0", port=8001, reload=True)
+    uvicorn.run("main:app", host="0.0.0.0", port=8002, reload=True)
     print("Hello from superbill-medical-agent!")
 
 

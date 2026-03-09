@@ -7,6 +7,7 @@ from typing import Any, Dict, List
 
 sys.path.append(str(Path(__file__).parent.parent))
 from config.schema import BillingState
+from src.agent.state_helpers import _append_narrative
 
 
 CODE_FENCE_RE = re.compile(r"^```(?:json)?\s*|```$", re.IGNORECASE)
@@ -42,7 +43,9 @@ def _index_retrieval(retrieval: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any
             if code:
                 enm[code] = meta
         elif item_type == "modifier":
-            code = str(meta.get("modifier")) if meta.get("modifier") is not None else None
+            code = (
+                str(meta.get("modifier")) if meta.get("modifier") is not None else None
+            )
             if code:
                 modifiers[code] = meta
 
@@ -158,6 +161,130 @@ def _normalize_charge_per_unit(value: Any) -> bool:
     return False
 
 
+def _resolve_charge_per_unit(meta: Dict[str, Any]) -> bool:
+    if not isinstance(meta, dict):
+        return False
+    for key in ("ChargePerUnit", "chargePerUnit", "charge_per_unit"):
+        if key in meta:
+            return _normalize_charge_per_unit(meta.get(key))
+    return False
+
+
+def _resolve_qty(item: Dict[str, Any], meta: Dict[str, Any]) -> int:
+    qty_value = item.get("units", None)
+    if qty_value is None:
+        qty_value = item.get("qty", None)
+    if qty_value is None:
+        qty_value = item.get("quantity", None)
+    try:
+        qty = int(qty_value) if qty_value is not None else 1
+    except (TypeError, ValueError):
+        qty = 1
+
+    min_qty_raw = meta.get("minQty") if isinstance(meta, dict) else None
+    max_qty_raw = meta.get("maxQty") if isinstance(meta, dict) else None
+
+    try:
+        min_qty = (
+            int(min_qty_raw)
+            if min_qty_raw is not None and str(min_qty_raw).strip() != ""
+            else None
+        )
+    except (TypeError, ValueError):
+        min_qty = None
+    try:
+        max_qty = (
+            int(max_qty_raw)
+            if max_qty_raw is not None and str(max_qty_raw).strip() != ""
+            else None
+        )
+    except (TypeError, ValueError):
+        max_qty = None
+
+    if min_qty is not None:
+        qty = max(qty, min_qty)
+    if max_qty is not None and max_qty > 0:
+        qty = min(qty, max_qty)
+    return max(qty, 1)
+
+
+def _dedupe_upper(values: List[str]) -> List[str]:
+    out: List[str] = []
+    seen: set[str] = set()
+    for value in values:
+        text = str(value or "").strip().upper()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        out.append(text)
+    return out
+
+
+def _line_dx_codes(item: Dict[str, Any], global_icd10: List[str]) -> List[str]:
+    item_level = (
+        _normalize_list(item.get("linked_icd10"))
+        or _normalize_list(item.get("diagnosis_links"))
+        or _normalize_list(item.get("dx_codes"))
+    )
+    if item_level:
+        return _dedupe_upper(item_level)
+
+    if len(global_icd10) == 1:
+        return _dedupe_upper(global_icd10)
+
+    return []
+
+
+def _normalize_billing_party(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    if text in {"ins", "insurance", "carrier", "payer"}:
+        return "INS"
+    if text in {"pat", "patient", "self", "self-pay", "self_pay"}:
+        return "PAT"
+    if text in {"nc", "non-covered", "noncovered", "no-charge", "no_charge"}:
+        return "NC"
+    return ""
+
+
+def _extract_billing_party(item: Dict[str, Any]) -> str:
+    for key in (
+        "billing_party",
+        "bill_to",
+        "payer",
+        "pay_type",
+        "ins_pat_nc",
+        "insurance_type",
+    ):
+        if key in item:
+            party = _normalize_billing_party(item.get(key))
+            if party:
+                return party
+    return ""
+
+
+def _extract_money(item: Dict[str, Any], *keys: str) -> float | None:
+    for key in keys:
+        if key not in item:
+            continue
+        raw = item.get(key)
+        if raw is None:
+            continue
+        text = str(raw).strip().replace("$", "").replace(",", "")
+        if not text:
+            continue
+        try:
+            return float(text)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _money_text(value: float | None) -> str:
+    if value is None:
+        return ""
+    return f"${value:.2f}"
+
+
 def _extract_item_modifiers(item: Dict[str, Any]) -> List[str]:
     return (
         _normalize_list(item.get("modifiers"))
@@ -181,6 +308,7 @@ def _candidate_metadata_index(items: Any) -> Dict[str, Dict[str, Any]]:
     return out
 
 
+# _append_narrative is imported from src.agent.state_helpers
 def _normalize_date_of_service(value: Any) -> str:
     text = str(value or "").strip()
     if not text:
@@ -192,7 +320,9 @@ def _normalize_date_of_service(value: Any) -> str:
     return text
 
 
-def _build_billing_html_table(note_id: Any, date_of_service: Any, billing_result: Dict[str, Any]) -> str:
+def _build_billing_html_table(
+    note_id: Any, date_of_service: Any, billing_result: Dict[str, Any]
+) -> str:
     note_id_text = escape(str(note_id or ""))
     dos_text = escape(_normalize_date_of_service(date_of_service))
     rows = billing_result.get("rows", []) if isinstance(billing_result, dict) else []
@@ -201,34 +331,45 @@ def _build_billing_html_table(note_id: Any, date_of_service: Any, billing_result
 
     row_html: List[str] = []
     for row in rows:
-        procedure = escape(str(row.get("procedure") or ""))
+        procedure = escape(str(row.get("procedure") or row.get("procedure_desc") or ""))
         code = escape(str(row.get("code") or ""))
         modifiers = row.get("modifiers")
         modifier_text = ""
         if isinstance(modifiers, list):
-            modifier_text = ", ".join(str(mod).strip() for mod in modifiers if str(mod).strip())
+            modifier_text = ", ".join(
+                str(mod).strip() for mod in modifiers if str(mod).strip()
+            )
         else:
             modifier_text = str(modifiers or "").strip()
 
         qty = escape(str(row.get("qty") if row.get("qty") is not None else ""))
         charge_per_unit_raw = str(row.get("charge_per_unit") or "").strip().upper()
         charge_per_unit = "Yes" if charge_per_unit_raw == "YES" else "No"
+        billing_party = str(row.get("billing_party") or "").upper()
+
+        ins_checked = "◉" if billing_party == "INS" else "○"
+        pat_checked = "◉" if billing_party == "PAT" else "○"
+        nc_checked = "◉" if billing_party == "NC" else "○"
 
         dx_codes = row.get("dx_codes")
         if isinstance(dx_codes, list):
-            dx_text = ", ".join(str(code).strip() for code in dx_codes if str(code).strip())
+            dx_text = ", ".join(
+                str(code).strip() for code in dx_codes if str(code).strip()
+            )
         else:
             dx_text = str(dx_codes or "").strip()
 
         row_html.append(
             "    <tr>"
-            f"<td>{dos_text}</td>"
             f"<td>{procedure}</td>"
             f"<td>{code}</td>"
             f"<td>{escape(modifier_text)}</td>"
+            f"<td>{escape(dx_text)}</td>"
+            f"<td style='text-align:center'>{ins_checked}</td>"
+            f"<td style='text-align:center'>{pat_checked}</td>"
+            f"<td style='text-align:center'>{nc_checked}</td>"
             f"<td>{qty}</td>"
             f"<td>{charge_per_unit}</td>"
-            f"<td>{escape(dx_text)}</td>"
             "</tr>"
         )
 
@@ -237,16 +378,18 @@ def _build_billing_html_table(note_id: Any, date_of_service: Any, billing_result
         '<table border="1" cellpadding="6" cellspacing="0" style="border-collapse:collapse; width:100%;">\n'
         "  <thead>\n"
         "    <tr>\n"
-        f"      <th colspan=\"7\" style=\"text-align:left;\">Note ID: {note_id_text}</th>\n"
+        f'      <th colspan="9" style="text-align:left;">Note ID: {note_id_text} | DOS: {dos_text}</th>\n'
         "    </tr>\n"
         "    <tr>\n"
-        "      <th>Date of Service</th>\n"
-        "      <th>Procedure Description</th>\n"
-        "      <th>CPT/HCPCS Code</th>\n"
-        "      <th>Modifiers (if any)</th>\n"
-        "      <th>Quantity</th>\n"
-        "      <th>Charge per Unit</th>\n"
-        "      <th>ICD-10 Codes</th>\n"
+        "      <th>Procedures</th>\n"
+        "      <th>Code</th>\n"
+        "      <th>Modifier</th>\n"
+        "      <th>Dx Code</th>\n"
+        "      <th>Ins.</th>\n"
+        "      <th>Pat.</th>\n"
+        "      <th>NC</th>\n"
+        "      <th>Qty.</th>\n"
+        "      <th>Per Unit</th>\n"
         "    </tr>\n"
         "  </thead>\n"
         "  <tbody>\n"
@@ -345,7 +488,9 @@ async def postprocess_billing_node(state: BillingState) -> BillingState:
 
     retrieval = state.get("retrieval", [])
     index = _index_retrieval(retrieval)
-    procedure_candidate_meta = _candidate_metadata_index(state.get("procedure_candidates"))
+    procedure_candidate_meta = _candidate_metadata_index(
+        state.get("procedure_candidates")
+    )
     enm_candidate_meta = _candidate_metadata_index(state.get("enm_candidates"))
     procedure_candidate_codes = _candidate_code_set(state.get("procedure_candidates"))
     enm_candidate_codes = _candidate_code_set(state.get("enm_candidates"))
@@ -356,8 +501,12 @@ async def postprocess_billing_node(state: BillingState) -> BillingState:
     dropped_em_codes: List[str] = []
     dropped_modifiers: List[str] = []
 
-    cpt_items = _normalize_code_items(_get_key(parsed, "CPT_codes", "cpt_codes", "CPT", "cpt", "procedures"))
-    em_raw = _get_key(parsed, "E_M_codes", "em_codes", "E/M", "em", "evaluation_and_management")
+    cpt_items = _normalize_code_items(
+        _get_key(parsed, "CPT_codes", "cpt_codes", "CPT", "cpt", "procedures")
+    )
+    em_raw = _get_key(
+        parsed, "E_M_codes", "em_codes", "E/M", "em", "evaluation_and_management"
+    )
     em_items = _normalize_code_items(em_raw)
     if not em_items and isinstance(em_raw, dict):
         em_items = [em_raw]
@@ -366,30 +515,58 @@ async def postprocess_billing_node(state: BillingState) -> BillingState:
     for item in cpt_items:
         if isinstance(item, dict) and "code" not in item and item.get("cpt"):
             item["code"] = item.get("cpt")
-        if isinstance(item, dict) and "linked_icd10" not in item and item.get("linked_diagnosis_icd10"):
+        if (
+            isinstance(item, dict)
+            and "linked_icd10" not in item
+            and item.get("linked_diagnosis_icd10")
+        ):
             item["linked_icd10"] = item.get("linked_diagnosis_icd10")
     for item in em_items:
         if isinstance(item, dict) and "code" not in item and item.get("cpt"):
             item["code"] = item.get("cpt")
-        if isinstance(item, dict) and "linked_icd10" not in item and item.get("linked_diagnosis_icd10"):
+        if (
+            isinstance(item, dict)
+            and "linked_icd10" not in item
+            and item.get("linked_diagnosis_icd10")
+        ):
             item["linked_icd10"] = item.get("linked_diagnosis_icd10")
 
-    service_items = _normalize_code_items(_get_key(parsed, "cpt_services", "services", "service_lines"))
+    service_items = _normalize_code_items(
+        _get_key(parsed, "cpt_services", "services", "service_lines")
+    )
     if service_items:
-        parsed_cpt_items, parsed_em_items = _partition_service_items(service_items, index["enm"])
+        parsed_cpt_items, parsed_em_items = _partition_service_items(
+            service_items, index["enm"]
+        )
         if not cpt_items:
             cpt_items = parsed_cpt_items
         if not em_items:
             em_items = parsed_em_items
 
     icd10_codes = _normalize_icd10(
-        _get_key(parsed, "ICD10_codes", "icd10_codes", "ICD10", "icd10", "icd10_diagnoses", "diagnoses")
+        _get_key(
+            parsed,
+            "ICD10_codes",
+            "icd10_codes",
+            "ICD10",
+            "icd10",
+            "icd10_diagnoses",
+            "diagnoses",
+        )
     )
     modifiers_section = _normalize_modifiers(_get_key(parsed, "Modifiers", "modifiers"))
     reasoning = _get_key(parsed, "Reasoning", "reasoning")
 
-    pre_gate_procedure_codes = [str(item.get("code") or "").strip() for item in cpt_items if str(item.get("code") or "").strip()]
-    pre_gate_em_codes = [str(item.get("code") or "").strip() for item in em_items if str(item.get("code") or "").strip()]
+    pre_gate_procedure_codes = [
+        str(item.get("code") or "").strip()
+        for item in cpt_items
+        if str(item.get("code") or "").strip()
+    ]
+    pre_gate_em_codes = [
+        str(item.get("code") or "").strip()
+        for item in em_items
+        if str(item.get("code") or "").strip()
+    ]
 
     if procedure_candidate_codes:
         kept_items: List[Dict[str, Any]] = []
@@ -404,7 +581,9 @@ async def postprocess_billing_node(state: BillingState) -> BillingState:
         filtered = before - len(cpt_items)
         if filtered > 0:
             needs_review = True
-            review_reasons.append(f"Filtered {filtered} procedure code(s) not present in procedure candidates.")
+            review_reasons.append(
+                f"Filtered {filtered} procedure code(s) not present in procedure candidates."
+            )
 
     if enm_candidate_codes:
         kept_items: List[Dict[str, Any]] = []
@@ -419,9 +598,16 @@ async def postprocess_billing_node(state: BillingState) -> BillingState:
         filtered = before - len(em_items)
         if filtered > 0:
             needs_review = True
-            review_reasons.append(f"Filtered {filtered} E/M code(s) not present in E/M candidates.")
+            review_reasons.append(
+                f"Filtered {filtered} E/M code(s) not present in E/M candidates."
+            )
 
     modifier_rules = list(index["modifiers"].values())
+    retrieval_modifier_codes = {
+        str(code).strip().upper()
+        for code in index["modifiers"].keys()
+        if str(code).strip()
+    }
     state["modifier_rules"] = modifier_rules
 
     selected_cpts = []
@@ -440,28 +626,35 @@ async def postprocess_billing_node(state: BillingState) -> BillingState:
         modifier = mod.get("modifier")
         applies_to = mod.get("applies_to", [])
         if modifier:
-            if modifier_candidate_codes and str(modifier).strip() not in modifier_candidate_codes:
+            normalized_modifier = str(modifier).strip().upper()
+            if (
+                modifier_candidate_codes
+                and normalized_modifier not in {m.upper() for m in modifier_candidate_codes}
+                and normalized_modifier not in retrieval_modifier_codes
+            ):
                 needs_review = True
-                review_reasons.append(f"Dropped modifier {modifier} not present in modifier candidates.")
-                dropped_modifiers.append(str(modifier).strip())
+                review_reasons.append(
+                    f"Dropped modifier {normalized_modifier} not present in modifier candidates or retrieval references."
+                )
+                dropped_modifiers.append(normalized_modifier)
                 continue
             normalized_targets = _normalize_list(applies_to)
             if not normalized_targets:
-                global_modifiers.append(str(modifier))
+                global_modifiers.append(normalized_modifier)
                 modifier_decisions.append(
                     {
                         "source": "llm_global",
-                        "modifier": str(modifier),
+                        "modifier": normalized_modifier,
                         "code": None,
                         "reason": "LLM returned modifier without CPT target; applied globally.",
                     }
                 )
             for code in normalized_targets:
-                modifier_map.setdefault(code, []).append(str(modifier))
+                modifier_map.setdefault(str(code).strip(), []).append(normalized_modifier)
                 modifier_decisions.append(
                     {
                         "source": "llm_targeted",
-                        "modifier": str(modifier),
+                        "modifier": normalized_modifier,
                         "code": str(code),
                         "reason": "LLM explicitly targeted this CPT code.",
                     }
@@ -479,20 +672,31 @@ async def postprocess_billing_node(state: BillingState) -> BillingState:
         )
         if not meta:
             needs_review = True
-            review_reasons.append(f"Missing retrieval rule metadata for code {code}; charge per unit could not be sourced.")
+            review_reasons.append(
+                f"Missing retrieval rule metadata for code {code}; charge per unit could not be sourced."
+            )
 
-        charge_per_unit_flag = _normalize_charge_per_unit(meta.get("ChargePerUnit")) if meta else False
+        charge_per_unit_flag = _resolve_charge_per_unit(meta)
         charge_flag = "YES" if charge_per_unit_flag else "NO"
 
-        qty_value = item.get("units", None)
-        if qty_value is None:
-            qty_value = item.get("qty", None)
-        if qty_value is None:
-            qty_value = item.get("quantity", None)
-        try:
-            qty = int(qty_value) if qty_value is not None else 1
-        except (TypeError, ValueError):
-            qty = 1
+        qty = _resolve_qty(item, meta)
+        billing_party = _extract_billing_party(item)
+        charge_unit = _extract_money(
+            item,
+            "charge_unit",
+            "charge_per_unit_amount",
+            "unit_charge",
+            "rate",
+            "fee",
+        )
+        total_charges = _extract_money(
+            item,
+            "charges",
+            "total_charge",
+            "line_total",
+        )
+        if total_charges is None and charge_unit is not None:
+            total_charges = charge_unit * qty
 
         # Modifiers should come from the LLM output (global + CPT-targeted),
         # not by blindly attaching every retrieved modifier reference.
@@ -502,16 +706,23 @@ async def postprocess_billing_node(state: BillingState) -> BillingState:
         llm_item_modifiers = _extract_item_modifiers(item)
         accepted_llm_modifiers: List[str] = []
         for mod in llm_item_modifiers:
-            if modifier_candidate_codes and str(mod).strip() not in modifier_candidate_codes:
+            normalized_mod = str(mod).strip().upper()
+            if (
+                modifier_candidate_codes
+                and normalized_mod not in {m.upper() for m in modifier_candidate_codes}
+                and normalized_mod not in retrieval_modifier_codes
+            ):
                 needs_review = True
-                review_reasons.append(f"Dropped line-level modifier {mod} not present in modifier candidates.")
-                dropped_modifiers.append(str(mod).strip())
+                review_reasons.append(
+                    f"Dropped line-level modifier {normalized_mod} not present in modifier candidates or retrieval references."
+                )
+                dropped_modifiers.append(normalized_mod)
                 continue
-            accepted_llm_modifiers.append(mod)
+            accepted_llm_modifiers.append(normalized_mod)
             modifier_decisions.append(
                 {
                     "source": "llm_item",
-                    "modifier": mod,
+                    "modifier": normalized_mod,
                     "code": code,
                     "reason": "Modifier present directly on LLM CPT/E&M item.",
                 }
@@ -528,21 +739,29 @@ async def postprocess_billing_node(state: BillingState) -> BillingState:
                 continue
             cleaned_modifiers.append(m)
 
+        linked_dx = _line_dx_codes(item, icd10_codes)
+        if not linked_dx and len(icd10_codes) > 1:
+            needs_review = True
+            review_reasons.append(
+                f"Code {code} has multiple encounter DX options but no explicit CPT↔DX linkage from model output."
+            )
+
         rows.append(
             {
                 "procedure": item.get("description") or meta.get("codeDesc"),
+                "procedure_desc": item.get("description") or meta.get("codeDesc"),
                 "code": code,
-                "modifiers": sorted({m for m in cleaned_modifiers if m}),
-                "dx_codes": (
-                    _normalize_list(item.get("linked_icd10"))
-                    or _normalize_list(item.get("diagnosis_links"))
-                    or _normalize_list(item.get("dx_codes"))
-                    or icd10_codes
-                ),
+                "modifiers": sorted({str(m).strip().upper() for m in cleaned_modifiers if str(m).strip()}),
+                "dx_codes": linked_dx,
+                "dx_code": ", ".join(linked_dx),
+                "billing_party": billing_party,
+                "ins": billing_party == "INS",
+                "pat": billing_party == "PAT",
+                "nc": billing_party == "NC",
                 "qty": qty,
                 "charge_per_unit": charge_flag,
-                "charge_unit": None,
-                "charges": None,
+                "charge_unit": _money_text(charge_unit),
+                "charges": _money_text(total_charges),
             }
         )
 
@@ -611,7 +830,9 @@ async def postprocess_billing_node(state: BillingState) -> BillingState:
             "status": "needs_review",
             "reasons": review_reasons,
             "llm_requested_codes": {
-                "procedure": sorted({code for code in pre_gate_procedure_codes if code}),
+                "procedure": sorted(
+                    {code for code in pre_gate_procedure_codes if code}
+                ),
                 "em": sorted({code for code in pre_gate_em_codes if code}),
             },
             "dropped": {
@@ -620,19 +841,30 @@ async def postprocess_billing_node(state: BillingState) -> BillingState:
                 "modifiers": sorted({code for code in dropped_modifiers if code}),
             },
             "candidate_alternatives": {
-                "procedure": _top_candidate_summary(state.get("procedure_candidates"), 5),
+                "procedure": _top_candidate_summary(
+                    state.get("procedure_candidates"), 5
+                ),
                 "em": _top_candidate_summary(state.get("enm_candidates"), 5),
                 "modifier": _top_candidate_summary(state.get("modifier_candidates"), 8),
             },
         }
     state["manual_review"] = manual_review
 
+    # Attach patient / visit / note identity so the API response is self-contained.
+    notes_for_result = (
+        state.get("notes", {}) if isinstance(state.get("notes"), dict) else {}
+    )
     state["billing_result"] = {
+        "note_id": state.get("note_id"),
+        "patient": notes_for_result.get("patient"),
+        "visit": notes_for_result.get("visit"),
         "rows": rows,
         "icd10_codes": icd10_codes,
         "modifier_decisions": modifier_decisions,
         "em_decisions": em_decisions,
         "reasoning": reasoning,
+        "narrative_summary": state.get("narrative_summary", ""),
+        "self_correction_notes": state.get("self_correction_notes", []),
         "needs_review": needs_review,
         "review_reasons": review_reasons,
         "manual_review": manual_review,
@@ -642,7 +874,9 @@ async def postprocess_billing_node(state: BillingState) -> BillingState:
     notes = state.get("notes", {}) if isinstance(state.get("notes"), dict) else {}
     visit = notes.get("visit", {}) if isinstance(notes.get("visit"), dict) else {}
     date_of_service = visit.get("date")
-    billing_html_table = _build_billing_html_table(state.get("note_id"), date_of_service, state["billing_result"])
+    billing_html_table = _build_billing_html_table(
+        state.get("note_id"), date_of_service, state["billing_result"]
+    )
     state["billing_result"]["html_table"] = billing_html_table
     state["html_table"] = billing_html_table
 

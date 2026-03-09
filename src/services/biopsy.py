@@ -1,15 +1,13 @@
-
 import sys
 import asyncio
 from pathlib import Path
+
 sys.path.append(str(Path(__file__).parent.parent.parent))
 from sqlalchemy import text
 from database.deps import async_db_session
 from loguru import logger
-logger.add("logs/biopsy.log", rotation="10 MB")
-from database.deps import async_db_session
-from database.conn import async_engine
 
+logger.add("logs/biopsy.log", rotation="10 MB")
 
 
 async def biopsy_notes(note_id: int):
@@ -35,22 +33,20 @@ async def biopsy_notes(note_id: int):
         """
         )
         result = await db.execute(biopsy_query, {"note_id": note_id})
-        biopsy_notes = result.mappings().all()
-        if not biopsy_notes:
+        rows = result.mappings().all()
+        if not rows:
             return []
-        return [dict(row) for row in biopsy_notes]
-    
+        return [dict(row) for row in rows]
 
 
 async def main(note_id: int):
+    from database.conn import async_engine
+
     try:
         result = await biopsy_notes(note_id)
         return result
     finally:
         await async_engine.dispose()
-
-
-
 
 
 if __name__ == "__main__":

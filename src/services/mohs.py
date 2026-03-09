@@ -1,25 +1,21 @@
-
-import sys
 import asyncio
+import sys
 from pathlib import Path
+
 sys.path.append(str(Path(__file__).parent.parent.parent))
 from sqlalchemy import text
 from database.deps import async_db_session
 from loguru import logger
+
 logger.add("logs/mohs.log", rotation="10 MB")
-from database.deps import async_db_session
-from database.conn import async_engine
-
-
 
 
 async def mohs_notes(note_id: int):
     """Fetch mohs notes for a given note ID."""
     async with async_db_session() as db:
         mohs_query = text(
-
-        """
-        SELECT 
+            """
+        SELECT
         papm.noteId, pl.proName , papm.assessmentId, papm.mohsId, papm.drawingId, papm.providerId, papm.asprin, papm.coumadin, papm.plavix, papm.vitamine,
         papm.warfarin, sl.site, sll.location, papm.preOpSize, pcl.cleansing, pal.anesthesia, papm.preMohsNote, papm.postMohsSizeLinear, papm.curettage, papm.hPressure,
         papm.hCautery, papm.hLigation, papm.hGelfoam, papm.hPacking, papm.mohsNote, papm.postMohsSize, papm.refForRepair, papm.electroDessi, papm.refRepairTo, papm.repairId,
@@ -38,21 +34,20 @@ async def mohs_notes(note_id: int):
                 """
         )
         result = await db.execute(mohs_query, {"note_id": note_id})
-        mohs_notes = result.mappings().all()
-        if not mohs_notes:
+        rows = result.mappings().all()
+        if not rows:
             return []
-        return [dict(row) for row in mohs_notes]
-    
-    
+        return [dict(row) for row in rows]
+
+
 async def main(note_id: int):
+    from database.conn import async_engine
+
     try:
         result = await mohs_notes(note_id)
         return result
     finally:
         await async_engine.dispose()
-
-
-
 
 
 if __name__ == "__main__":

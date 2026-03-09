@@ -3,18 +3,17 @@ import asyncio
 from pathlib import Path
 from typing import Sequence
 from sqlalchemy.engine import RowMapping
+
 sys.path.append(str(Path(__file__).parent.parent))
 from src.services.biopsy import biopsy_notes
 from utils.helper import parse_size
-from database.conn import async_engine
 from loguru import logger
 import warnings
+
 warnings.filterwarnings("ignore", category=RuntimeWarning)
 
-logger.add("logs/mohs_context.log", rotation="10 MB")
-
-
-
+# Fixed: was incorrectly writing to logs/mohs_context.log
+logger.add("logs/biopsy_context.log", rotation="10 MB")
 
 
 async def biopsy_context(note_id: int) -> dict:
@@ -30,7 +29,13 @@ async def biopsy_context(note_id: int) -> dict:
         def parse_cm_area(value: object) -> dict:
             """Parse stored strings like 'cm,Area,1.2-1' into friendly numbers."""
             if not isinstance(value, str) or not value:
-                return {"raw": value, "unit": None, "length_cm": None, "width_cm": None, "max_dimension_cm": None}
+                return {
+                    "raw": value,
+                    "unit": None,
+                    "length_cm": None,
+                    "width_cm": None,
+                    "max_dimension_cm": None,
+                }
             raw = value
             parts = [p.strip() for p in raw.split(",") if p.strip()]
             unit = parts[0] if parts else None
@@ -79,7 +84,9 @@ async def biopsy_context(note_id: int) -> dict:
             undermining = bool(item.get("undermining"))
             dog_ear = bool(item.get("dogEar"))
             flap_closure = item.get("flapClosure")
-            has_flap_closure = bool(flap_closure) and str(flap_closure).strip().lower() not in {"null", "none", "0"}
+            has_flap_closure = bool(flap_closure) and str(
+                flap_closure
+            ).strip().lower() not in {"null", "none", "0"}
 
             if undermining or dog_ear or has_flap_closure:
                 closure_hint = "complex"
@@ -87,6 +94,7 @@ async def biopsy_context(note_id: int) -> dict:
                 closure_hint = "layered"
             else:
                 closure_hint = None
+
             procedure_category = None
             if isinstance(procedure_name, str):
                 low = procedure_name.lower()
@@ -95,33 +103,38 @@ async def biopsy_context(note_id: int) -> dict:
                 elif "biopsy" in low:
                     procedure_category = "biopsy"
 
-            details.append({
-                "procedure_name": procedure_name,
-                "procedure_category": procedure_category,
-                "technique": item.get("method"),
-                "site": item.get("site"),
-                "laterality": item.get("location"),
-                "rule_out_diagnosis": item.get("ruleOutDx"),
-                "lesion_size": lesion_size,
-                "margins_checked": item.get("checkMargin"),
-                "margin_options": item.get("marginOptions"),
-                "undermining": undermining,
-                "undermining_size": undermining_size,
-                "dog_ear": dog_ear,
-                "dog_ear_count": item.get("dogEarCount"),
-                "flap_closure": flap_closure,
-                "pathology_submitted": bool(item.get("pathology")),
-                "frozen_section": bool(item.get("frozenSection")),
-                "anesthesia": item.get("anesthesia"),
-                "dressing": item.get("dressing"),
-                "wound_size": wound_size,
-                "closure_size": closure_size,
-                "closure_hint": closure_hint,
-                "int_suture_size": item.get("intSutureSize"),
-                "ext_suture_size": item.get("extSutureSize"),
-                "repair_date": item.get("repairDate"),
-                "notes": item.get("notes"),
-            })
+            details.append(
+                {
+                    "procedure_name": procedure_name,
+                    "procedure_category": procedure_category,
+                    "technique": item.get("method"),
+                    "site": item.get("site"),
+                    "laterality": item.get("location"),
+                    "rule_out_diagnosis": item.get("ruleOutDx"),
+                    "lesion_size": lesion_size,
+                    "margins_checked": item.get("checkMargin"),
+                    "margin_options": item.get("marginOptions"),
+                    "undermining": undermining,
+                    "undermining_size": undermining_size,
+                    "dog_ear": dog_ear,
+                    "dog_ear_count": item.get("dogEarCount"),
+                    "flap_closure": flap_closure,
+                    "pathology_submitted": bool(item.get("pathology")),
+                    "frozen_section": bool(item.get("frozenSection")),
+                    "anesthesia": item.get("anesthesia"),
+                    "dressing": item.get("dressing"),
+                    "wound_size": wound_size,
+                    "closure_size": closure_size,
+                    "closure_hint": closure_hint,
+                    # Pass suture booleans through so postprocess/fact_extractor can infer closure
+                    "int_suture": has_deep_sutures,
+                    "ext_suture": has_superficial_sutures,
+                    "int_suture_size": item.get("intSutureSize"),
+                    "ext_suture_size": item.get("extSutureSize"),
+                    "repair_date": item.get("repairDate"),
+                    "notes": item.get("notes"),
+                }
+            )
 
         return {
             "biopsy": {
@@ -134,11 +147,8 @@ async def biopsy_context(note_id: int) -> dict:
     except Exception as e:
         logger.error(f"Error in biopsy_context: {e}")
         return {"error": str(e)}
-
-    finally:
-        await async_engine.dispose()
-
-
+    # No async_engine.dispose() — disposing the shared pool on every request
+    # breaks the connection pool for subsequent requests.
 
 
 if __name__ == "__main__":

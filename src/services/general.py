@@ -1,17 +1,17 @@
+import asyncio
 import sys
 from pathlib import Path
+
 sys.path.append(str(Path(__file__).parent.parent.parent))
 from sqlalchemy import text
 from database.deps import async_db_session
 from loguru import logger
-logger.add("logs/mohs.log", rotation="10 MB")
-from database.deps import async_db_session
-from database.conn import async_engine
 
+logger.add("logs/general.log", rotation="10 MB")
 
 
 async def general_notes(note_id: int):
-    """Fetch general notes for a given note ID."""
+    """Fetch general procedure notes for a given note ID."""
     async with async_db_session() as db:
         general_query = text(
             """
@@ -28,12 +28,10 @@ async def general_notes(note_id: int):
         """
         )
         result = await db.execute(general_query, {"note_id": note_id})
-        general_notes = result.mappings().all()
-        if not general_notes:
+        rows = result.mappings().all()
+        if not rows:
             return []
-        return [dict(row) for row in general_notes]
-    
-    
+        return [dict(row) for row in rows]
 
 
 async def prescription_notes(note_id: int):
@@ -45,16 +43,14 @@ async def prescription_notes(note_id: int):
         """
         )
         result = await db.execute(prescription_query, {"note_id": note_id})
-        prescription_notes = result.mappings().all()
-        if not prescription_notes:
+        rows = result.mappings().all()
+        if not rows:
             return []
-        return [dict(row) for row in prescription_notes]
-
-
+        return [dict(row) for row in rows]
 
 
 async def previous_superbill(note_id: int):
-    """Fetch previous superbill data for a given note ID."""
+    """Fetch previous superbill data for the note immediately preceding note_id."""
     async with async_db_session() as db:
         superbill_query = text(
             """
@@ -75,44 +71,39 @@ async def previous_superbill(note_id: int):
         """
         )
         result = await db.execute(superbill_query, {"note_id": note_id})
-        superbill_data = result.mappings().all()
-        if not superbill_data:
+        rows = result.mappings().all()
+        if not rows:
             return []
-        return [dict(row) for row in superbill_data]
-
-
+        return [dict(row) for row in rows]
 
 
 async def previous_medications(note_id: int, patient_id: int):
-    """Fetch previous medications for a given note ID."""
+    """Fetch the most recent prior note's medication data for the patient."""
     async with async_db_session() as db:
         medication_query = text(
             """
         SELECT * FROM progressNotes WHERE noteId < :note_id AND patientId = :patient_id and pathNote = 0 ORDER BY noteId DESC LIMIT 1
         """
         )
-        result = await db.execute(medication_query, {"note_id": note_id, "patient_id": patient_id})
-        medications = result.mappings().all()
-        if not medications:
+        result = await db.execute(
+            medication_query, {"note_id": note_id, "patient_id": patient_id}
+        )
+        rows = result.mappings().all()
+        if not rows:
             return []
-        return [dict(row) for row in medications]
+        return [dict(row) for row in rows]
 
 
-
-
-import asyncio
 async def main():
+    from database.conn import async_engine
+
     note_id = 671744
-    patient_id = 198538
 
     try:
         result = await general_notes(note_id)
         print(result)
     finally:
         await async_engine.dispose()
-
-
-
 
 
 if __name__ == "__main__":

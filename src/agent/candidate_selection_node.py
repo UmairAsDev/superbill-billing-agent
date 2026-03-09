@@ -1,12 +1,10 @@
-import re
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
 sys.path.append(str(Path(__file__).parent.parent))
 from config.schema import BillingState
-
-ICD_RE = re.compile(r"\b[A-TV-Z][0-9][0-9AB](?:\.[0-9A-TV-Z]{1,4})?\b")
+from src.agent.state_helpers import ICD_RE, _append_narrative
 
 
 def _to_text(value: Any) -> str:
@@ -28,16 +26,24 @@ def _fact_list(facts: Dict[str, Any], key: str) -> List[str]:
     return []
 
 
-def _score_procedure(meta: Dict[str, Any], content: str, facts: Dict[str, Any], dx_codes: set[str]) -> Tuple[int, List[str]]:
+def _score_procedure(
+    meta: Dict[str, Any], content: str, facts: Dict[str, Any], dx_codes: set[str]
+) -> Tuple[int, List[str]]:
     reasons: List[str] = []
     score = 0
 
-    flags = facts.get("procedure_flags", {}) if isinstance(facts.get("procedure_flags"), dict) else {}
+    flags = (
+        facts.get("procedure_flags", {})
+        if isinstance(facts.get("procedure_flags"), dict)
+        else {}
+    )
     documented = " ".join(_fact_list(facts, "documented_procedures")).lower()
     sites = " ".join(_fact_list(facts, "sites")).lower()
     content_lower = content.lower()
 
-    if flags.get("biopsy_performed") and any(k in content_lower for k in ["biopsy", "tangential", "shave"]):
+    if flags.get("biopsy_performed") and any(
+        k in content_lower for k in ["biopsy", "tangential", "shave"]
+    ):
         score += 4
         reasons.append("biopsy flag aligns")
     if flags.get("mohs_performed") and "mohs" in content_lower:
@@ -61,7 +67,9 @@ def _score_procedure(meta: Dict[str, Any], content: str, facts: Dict[str, Any], 
     return score, reasons
 
 
-def _score_enm(meta: Dict[str, Any], content: str, facts: Dict[str, Any]) -> Tuple[int, List[str]]:
+def _score_enm(
+    meta: Dict[str, Any], content: str, facts: Dict[str, Any]
+) -> Tuple[int, List[str]]:
     reasons: List[str] = []
     score = 0
 
@@ -98,35 +106,68 @@ def _score_enm(meta: Dict[str, Any], content: str, facts: Dict[str, Any]) -> Tup
     return score, reasons
 
 
-def _score_modifier(meta: Dict[str, Any], content: str, facts: Dict[str, Any]) -> Tuple[int, List[str]]:
+def _score_modifier(
+    meta: Dict[str, Any], content: str, facts: Dict[str, Any]
+) -> Tuple[int, List[str]]:
     reasons: List[str] = []
     score = 0
 
     modifier = str(meta.get("modifier") or "").strip().upper()
     laterality = {str(v).lower() for v in _fact_list(facts, "laterality")}
-
-    score += 1
-    reasons.append("active modifier")
+    visit_type = _to_text(facts.get("visit_type"))
+    patient_type = _to_text(facts.get("patient_type"))
+    procedures_text = " ".join(_fact_list(facts, "documented_procedures")).lower()
+    sites_text = " ".join(_fact_list(facts, "sites")).lower()
+    content_lower = content.lower()
 
     if "left" in laterality and modifier == "LT":
-        score += 2
+        score += 4
         reasons.append("laterality left")
     if "right" in laterality and modifier == "RT":
-        score += 2
+        score += 4
         reasons.append("laterality right")
 
-    if bool(meta.get("enmModifier")):
-        score += 1
-        reasons.append("eligible for E/M")
+    if modifier in {"LT", "RT"} and not laterality:
+        score -= 3
+        reasons.append("no laterality evidence")
 
-    if "distinct procedural service" in content.lower():
-        score += 1
+    if bool(meta.get("enmModifier")):
+        if visit_type != "procedure_only" or patient_type in {"new", "established"}:
+            score += 2
+            reasons.append("E/M encounter context")
+        else:
+            score -= 1
+            reasons.append("deprioritize E/M modifier in procedure-only visit")
+
+    if "distinct procedural service" in content_lower and any(
+        token in procedures_text for token in ["biopsy", "excision", "mohs"]
+    ):
+        score += 2
         reasons.append("distinct procedure option")
+
+    for token in procedures_text.split()[:12]:
+        if len(token) > 3 and token in content_lower:
+            score += 1
+            reasons.append("procedure text overlap")
+            break
+
+    for token in sites_text.split()[:8]:
+        if len(token) > 3 and token in content_lower:
+            score += 1
+            reasons.append("site overlap")
+            break
 
     return score, reasons
 
 
-def _candidate_item(category: str, code: str, meta: Dict[str, Any], content: str, score: int, reasons: List[str]) -> Dict[str, Any]:
+def _candidate_item(
+    category: str,
+    code: str,
+    meta: Dict[str, Any],
+    content: str,
+    score: int,
+    reasons: List[str],
+) -> Dict[str, Any]:
     desc_key = "codeDesc" if category == "procedure" else "enmCodeDesc"
     desc = str(meta.get(desc_key) or "").strip()
     return {
@@ -141,12 +182,29 @@ def _candidate_item(category: str, code: str, meta: Dict[str, Any], content: str
 
 
 def _top_ranked(items: List[Dict[str, Any]], k: int) -> List[Dict[str, Any]]:
-    return sorted(items, key=lambda x: x.get("score", 0), reverse=True)[:k]
+    return sorted(
+        items,
+        key=lambda x: (
+            -(x.get("score", 0) if isinstance(x.get("score", 0), (int, float)) else 0),
+            str(x.get("code") or ""),
+            str(x.get("description") or ""),
+        ),
+    )[:k]
+
+
+def _filter_modifiers(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    if not items:
+        return []
+    return [item for item in items if int(item.get("score", 0)) >= 1]
 
 
 async def candidate_selection_node(state: BillingState) -> BillingState:
     retrieval = state.get("retrieval", [])
-    facts = state.get("encounter_facts", {}) if isinstance(state.get("encounter_facts"), dict) else {}
+    facts = (
+        state.get("encounter_facts", {})
+        if isinstance(state.get("encounter_facts"), dict)
+        else {}
+    )
     dx_codes = _extract_dx_codes(_fact_list(facts, "documented_dx_codes"))
 
     procedures: Dict[str, Dict[str, Any]] = {}
@@ -165,23 +223,53 @@ async def candidate_selection_node(state: BillingState) -> BillingState:
         if item_type == "procedure" and meta.get("proCode") is not None:
             code = str(meta.get("proCode"))
             score, reasons = _score_procedure(meta, content, facts, dx_codes)
-            procedures[code] = _candidate_item("procedure", code, meta, content, score, reasons)
-            reasoning.append({"category": "procedure", "code": code, "score": score, "reasons": reasons})
+            procedures[code] = _candidate_item(
+                "procedure", code, meta, content, score, reasons
+            )
+            reasoning.append(
+                {
+                    "category": "procedure",
+                    "code": code,
+                    "score": score,
+                    "reasons": reasons,
+                }
+            )
 
         elif item_type == "enm" and meta.get("enmCode") is not None:
             code = str(meta.get("enmCode"))
             score, reasons = _score_enm(meta, content, facts)
             enm[code] = _candidate_item("enm", code, meta, content, score, reasons)
-            reasoning.append({"category": "enm", "code": code, "score": score, "reasons": reasons})
+            reasoning.append(
+                {"category": "enm", "code": code, "score": score, "reasons": reasons}
+            )
 
         elif item_type == "modifier" and meta.get("modifier") is not None:
             code = str(meta.get("modifier"))
             score, reasons = _score_modifier(meta, content, facts)
-            modifiers[code] = _candidate_item("modifier", code, meta, content, score, reasons)
-            reasoning.append({"category": "modifier", "code": code, "score": score, "reasons": reasons})
+            modifiers[code] = _candidate_item(
+                "modifier", code, meta, content, score, reasons
+            )
+            reasoning.append(
+                {
+                    "category": "modifier",
+                    "code": code,
+                    "score": score,
+                    "reasons": reasons,
+                }
+            )
 
     state["procedure_candidates"] = _top_ranked(list(procedures.values()), k=15)
     state["enm_candidates"] = _top_ranked(list(enm.values()), k=10)
-    state["modifier_candidates"] = _top_ranked(list(modifiers.values()), k=20)
+    ranked_modifiers = _top_ranked(list(modifiers.values()), k=20)
+    state["modifier_candidates"] = _filter_modifiers(ranked_modifiers)
     state["candidate_reasoning"] = reasoning
+    _append_narrative(
+        state,
+        (
+            "candidate_selection_node: "
+            f"procedure_candidates={len(state['procedure_candidates'])} "
+            f"enm_candidates={len(state['enm_candidates'])} "
+            f"modifier_candidates={len(state['modifier_candidates'])}"
+        ),
+    )
     return state

@@ -1,49 +1,56 @@
 import sys
 from pathlib import Path
+
 sys.path.append(str(Path(__file__).parent.parent.parent))
 from langgraph.graph import StateGraph, END
 from config.schema import BillingState
 from src.agent.nodes import (
-	notes_node,
-	biopsy_node,
-	mohs_node,
-	prescriptions_node,
-	billing_reasoning_node,
+    notes_node,
+    biopsy_node,
+    mohs_node,
+    prescriptions_node,
+    general_node,
+    billing_reasoning_node,
 )
 from src.agent.retrieval_node import retrieval_node
 from src.agent.fact_extractor_node import note_fact_extractor_node
 from src.agent.candidate_selection_node import candidate_selection_node
 from src.agent.llm_node import billing_llm_node
+from src.agent.self_correction_node import self_correction_node
 from src.agent.postprocess_node import postprocess_billing_node
 
 
 def build_billing_graph():
-	graph = StateGraph(BillingState)
+    graph = StateGraph(BillingState)
 
-	graph.add_node("notes", notes_node)
-	graph.add_node("biopsy", biopsy_node)
-	graph.add_node("mohs", mohs_node)
-	graph.add_node("prescriptions", prescriptions_node)
-	graph.add_node("retrieval", retrieval_node)
-	graph.add_node("billing_reasoning", billing_reasoning_node)
-	graph.add_node("fact_extractor", note_fact_extractor_node)
-	graph.add_node("candidate_selection", candidate_selection_node)
-	graph.add_node("billing_llm", billing_llm_node)
-	graph.add_node("postprocess", postprocess_billing_node)
+    graph.add_node("notes", notes_node)
+    graph.add_node("biopsy", biopsy_node)
+    graph.add_node("mohs", mohs_node)
+    graph.add_node("prescriptions", prescriptions_node)
+    graph.add_node("general", general_node)
+    graph.add_node("retrieval", retrieval_node)
+    graph.add_node("billing_reasoning", billing_reasoning_node)
+    graph.add_node("fact_extractor", note_fact_extractor_node)
+    graph.add_node("candidate_selection", candidate_selection_node)
+    graph.add_node("billing_llm", billing_llm_node)
+    graph.add_node("self_correction", self_correction_node)
+    graph.add_node("postprocess", postprocess_billing_node)
 
-	graph.set_entry_point("notes")
-	graph.add_edge("notes", "biopsy")
-	graph.add_edge("biopsy", "mohs")
-	graph.add_edge("mohs", "prescriptions")
-	graph.add_edge("prescriptions", "retrieval")
-	graph.add_edge("retrieval", "billing_reasoning")
-	graph.add_edge("billing_reasoning", "fact_extractor")
-	graph.add_edge("fact_extractor", "candidate_selection")
-	graph.add_edge("candidate_selection", "billing_llm")
-	graph.add_edge("billing_llm", "postprocess")
-	graph.add_edge("postprocess", END)
+    graph.set_entry_point("notes")
+    graph.add_edge("notes", "biopsy")
+    graph.add_edge("biopsy", "mohs")
+    graph.add_edge("mohs", "prescriptions")
+    graph.add_edge("prescriptions", "general")
+    graph.add_edge("general", "fact_extractor")
+    graph.add_edge("fact_extractor", "retrieval")
+    graph.add_edge("retrieval", "billing_reasoning")
+    graph.add_edge("billing_reasoning", "candidate_selection")
+    graph.add_edge("candidate_selection", "billing_llm")
+    graph.add_edge("billing_llm", "self_correction")
+    graph.add_edge("self_correction", "postprocess")
+    graph.add_edge("postprocess", END)
 
-	return graph.compile()
+    return graph.compile()
 
 
 __all__ = ["build_billing_graph"]

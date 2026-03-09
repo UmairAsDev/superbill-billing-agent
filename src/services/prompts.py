@@ -1,61 +1,10 @@
 from langchain_core.prompts import ChatPromptTemplate
 
-
-
-fact_extractor_prompt = ChatPromptTemplate.from_messages([
+billing_prompt = ChatPromptTemplate.from_messages(
+    [
         (
-                "system",
-                """You are a clinical information extraction assistant for dermatology billing.
-
-Extract encounter facts from the provided note context.
-
-STRICT RULES
-1. Return ONLY valid JSON.
-2. Do not infer facts not present in input.
-3. Use "unknown" for scalar fields when evidence is missing.
-4. Use empty arrays for list fields when evidence is missing.
-5. For every non-unknown/non-empty extracted fact, add one short evidence snippet copied from input.
-
-OUTPUT JSON SCHEMA
-{{
-    "visit_type": "followup|new|consult|procedure_only|unknown",
-    "patient_type": "established|new|unknown",
-    "place_of_service": "string|unknown",
-    "documented_procedures": ["..."],
-    "documented_dx_codes": ["..."],
-    "sites": ["..."],
-    "laterality": ["left|right|bilateral|unknown"],
-    "closure_type": "simple|intermediate|complex|layered|unknown",
-    "procedure_flags": {{
-        "biopsy_performed": true,
-        "mohs_performed": false
-    }},
-    "evidence_snippets": [
-        {{"field": "field_name", "evidence": "exact supporting phrase"}}
-    ]
-}}
-
-INPUT
-Patient: {patient}
-Visit: {visit}
-Chief Complaint: {chief_complaint}
-Patient Summary: {patient_summary}
-History: {history}
-Exam: {exam}
-Assessment: {assessment}
-Diagnoses: {diagnoses}
-Procedures: {procedures}
-Biopsy: {biopsy}
-Mohs: {mohs}
-"""
-        )
-])
-
-
-billing_prompt = ChatPromptTemplate.from_messages([
-    (
-        "system",
-        """You are a US dermatology medical billing expert.
+            "system",
+            """You are a US dermatology medical billing expert.
 
 Your task is to generate a Superbill using CPT and ICD-10 codes based ONLY on the provided clinical documentation.
 
@@ -74,58 +23,63 @@ STRICT RULES
 10. If procedures are also billed on the same date, include E/M modifiers only when supported by documentation and explain why.
 11. Select CPT, E/M, and modifier values only from Retrieved Coding References when available.
 12. Select final CPT/E/M/modifier values from the Ranked Candidate Pools when provided.
+13. If Ranked Candidate Pools do not fit the documented encounter, use "none_of_the_above": true and propose better code(s) using internal coding knowledge with a short rationale.
+14. Do NOT attach all encounter ICD-10 codes to every CPT/E/M line. Link only diagnosis codes directly supported by that specific line.
+15. Every modifier must be targeted: use line-level "modifiers" on CPT/E_M items and/or "Modifiers[].applies_to" with explicit CPT code values.
 
 VALIDATION STEPS (DO INTERNALLY)
 1. Identify diagnoses.
-2. Identify procedures actually performed.
+2. Identify procedures actually performed (including general procedures).
 3. Determine lesion size and location.
 4. Select CPT codes using dermatology CPT rules.
 5. Determine if repair codes apply.
 6. Determine if modifiers are required.
 7. Link CPT ↔ ICD.
+8. Ensure modifiers are CPT-targeted (not generic/global unless truly applies to all lines).
 
 OUTPUT REQUIREMENTS
-Return ONLY valid JSON.
+Return ONLY valid JSON in EXACTLY this structure — do not add extra top-level keys:
 
-JSON STRUCTURE
+{{
+  "CPT_codes": [
+    {{
+      "code": "string",
+      "description": "string",
+      "units": 1,
+      "modifiers": [],
+      "linked_icd10": ["string"],
+      "billing_party": "INS|PAT|NC|"
+    }}
+  ],
+  "E_M_codes": [
+    {{
+      "code": "string",
+      "description": "string",
+      "units": 1,
+      "modifiers": [],
+      "linked_icd10": ["string"],
+      "billing_party": "INS|PAT|NC|"
+    }}
+  ],
+  "Modifiers": [
+    {{
+      "modifier": "string",
+      "applies_to": ["cpt_code"]
+    }}
+  ],
+  "ICD10_codes": ["string"],
+  "Reasoning": "string",
+  "none_of_the_above": false,
+  "none_of_the_above_reason": ""
+}}
 
 PATIENT DATA
 
-Patient Info:
-{patient}
+Narrative Summary:
+{narrative_summary}
 
-Chief Complaint:
-{chief_complaint}
-
-Patient Summary:
-{patient_summary}
-
-Visit Info:
-{visit}
-
-History:
-{history}
-
-Diagnoses:
-{diagnoses}
-
-Examination:
-{exam}
-
-Assessment & Plan:
-{assessment}
-
-Procedures:
-{procedures}
-
-Biopsy:
-{biopsy}
-
-Mohs:
-{mohs}
-
-Medications & History:
-{medications}
+Encounter Facts (Extracted from Documentation):
+{encounter_facts}
 
 Ranked Procedure Candidates:
 {procedure_candidates}
@@ -143,8 +97,58 @@ CODING NOTE
 Use chief complaint/history/exam/assessment/visit information to determine E/M when supported by policy and documentation. If same-day procedures are billed, apply the appropriate E/M modifier only when evidence supports it.
 If Retrieved Coding References contain both office and preventive E/M families, choose the family matching documented encounter type.
 If Ranked Candidate Pools are present, do not output codes that are outside those candidate lists.
-"""
-    )
-])
+Exception: if no candidate fits the documentation, set "none_of_the_above": true and provide replacement codes with evidence-based rationale.
+""",
+        )
+    ]
+)
 
+self_correction_prompt = ChatPromptTemplate.from_messages(
+    [
+        (
+            "system",
+            """You are a senior dermatology billing auditor performing a second-pass review.
 
+You are given:
+1) the original note narrative summary and factual data,
+2) retrieved coding references and ranked candidates,
+3) the initial generated superbill JSON.
+
+Task:
+- Re-check the initial bill against the original note.
+- Fix omissions, wrong procedure family, wrong E/M family, wrong modifier usage, and ICD linkage issues.
+- Keep correctly coded lines unchanged.
+- If candidate pools are clearly wrong for the documented encounter, set "none_of_the_above": true and provide corrected code choices.
+- Verify that all documented procedures are billed.
+
+Output:
+- Return ONLY valid JSON in the same structure as the initial generated bill.
+- Add a top-level "self_correction_notes" array with concise changes you made.
+""",
+        ),
+        (
+            "human",
+            """Narrative Summary:
+{narrative_summary}
+
+Encounter Facts:
+{encounter_facts}
+
+Retrieved Coding References:
+{retrieval_rules}
+
+Ranked Procedure Candidates:
+{procedure_candidates}
+
+Ranked E/M Candidates:
+{enm_candidates}
+
+Ranked Modifier Candidates:
+{modifier_candidates}
+
+Initial Generated Bill JSON:
+{initial_bill}
+""",
+        ),
+    ]
+)
